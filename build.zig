@@ -364,9 +364,9 @@ pub const EmLinkOptions = struct {
     shell_file_path: ?Build.LazyPath,
     extra_args: []const []const u8 = &.{},
 };
-pub fn emLinkStep(b: *Build, options: EmLinkOptions) !*Build.Step.InstallDir {
-    const emcc_path = emTool(b, options.emsdk, "emcc").getPath(b);
-    const emcc = b.addSystemCommand(&.{emcc_path});
+pub fn emLinkStep(b: *Build, options: EmLinkOptions) !Build.LazyPath {
+    const emcc_path = emTool(b, options.emsdk, "emcc");
+    const emcc = b.addRunFile(emcc_path);
     emcc.setName("emcc"); // hide emcc path
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
@@ -411,27 +411,20 @@ pub fn emLinkStep(b: *Build, options: EmLinkOptions) !*Build.Step.InstallDir {
         }
     }
     emcc.addArg("-o");
-    const out_file = emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
-
-    // the emcc linker creates 3 output files (.html, .wasm and .js)
-    const install = b.addInstallDirectory(.{
-        .source_dir = out_file.dirname(),
-        .install_dir = .prefix,
-        .install_subdir = "web",
-    });
-    install.step.dependOn(&emcc.step);
-    return install;
+    return emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
 }
 
 // build a run step which uses the emsdk emrun command to run a build target in the browser
 // NOTE: ideally this would go into a separate emsdk-zig package
 pub const EmRunOptions = struct {
-    name: []const u8,
+    file: Build.LazyPath,
     emsdk: *Build.Dependency,
 };
 pub fn emRunStep(b: *Build, options: EmRunOptions) *Build.Step.Run {
-    const emrun_path = emTool(b, options.emsdk, "emrun").getPath(b);
-    const emrun = b.addSystemCommand(&.{ emrun_path, b.fmt("{s}/web/{s}.html", .{ b.install_path, options.name }) });
+    const emrun_path = emTool(b, options.emsdk, "emrun");
+    const emrun = b.addRunFile(emrun_path);
+    emrun.addFileArg(options.file);
+
     return emrun;
 }
 
@@ -444,8 +437,8 @@ pub const EmBuilderOptions = struct {
     emsdk: *Build.Dependency,
 };
 pub fn emBuilderStep(b: *Build, options: EmBuilderOptions) *Build.Step.Run {
-    const embuilder_path = emTool(b, options.emsdk, "embuilder").getPath(b);
-    const embuilder = b.addSystemCommand(&.{embuilder_path});
+    const embuilder_path = emTool(b, options.emsdk, "embuilder");
+    const embuilder = b.addRunFile(embuilder_path);
     if (options.lto) {
         embuilder.addArg("--lto");
     }
@@ -471,10 +464,10 @@ pub fn emTool(b: *Build, emsdk: *Build.Dependency, tool: []const u8) Build.LazyP
 
 fn createEmsdkStep(b: *Build, emsdk: *Build.Dependency) *Build.Step.Run {
     if (builtin.os.tag == .windows) {
-        return b.addSystemCommand(&.{emSdkLazyPath(b, emsdk, &.{"emsdk.bat"}).getPath(b)});
+        return b.addRunFile(&.{emSdkLazyPath(b, emsdk, &.{"emsdk.bat"})});
     } else {
         const step = b.addSystemCommand(&.{"bash"});
-        step.addArg(emSdkLazyPath(b, emsdk, &.{"emsdk"}).getPath(b));
+        step.addFileArg(emSdkLazyPath(b, emsdk, &.{"emsdk"}));
         return step;
     }
 }
@@ -495,11 +488,12 @@ fn fileExists(b: *Build, path: []const u8) !bool {
 // since this will be cloned into a new zig cache directory which doesn't have
 // an .emscripten file yet until the one-time setup.
 fn emSdkSetupStep(b: *Build, emsdk: *Build.Dependency) !?*Build.Step.Run {
-    const dot_emsc_path = emSdkLazyPath(b, emsdk, &.{".emscripten"}).getPath(b);
-    const dot_emsc_exists = try fileExists(b, dot_emsc_path);
+    //const dot_emsc_path = emSdkLazyPath(b, emsdk, &.{".emscripten"}).getPath(b);
+    const dot_emsc_exists = false; //try fileExists(b, dot_emsc_path);
     if (!dot_emsc_exists) {
         const emsdk_install = createEmsdkStep(b, emsdk);
         emsdk_install.addArgs(&.{ "install", "latest" });
+
         const emsdk_activate = createEmsdkStep(b, emsdk);
         emsdk_activate.addArgs(&.{ "activate", "latest" });
         emsdk_activate.step.dependOn(&emsdk_install.step);
@@ -571,7 +565,7 @@ fn buildExample(b: *Build, example: Example, examples_step: *Build.Step, options
 
         // create a special emcc linker run step
         const backend = resolveSokolBackend(options.backend, options.target.result);
-        const link_step = try emLinkStep(b, .{
+        const out_file = try emLinkStep(b, .{
             .lib_main = example_step,
             .target = options.target,
             .optimize = options.optimize,
@@ -583,11 +577,18 @@ fn buildExample(b: *Build, example: Example, examples_step: *Build.Step, options
             .shell_file_path = b.path("src/sokol/web/shell.html"),
             .extra_args = &.{"-sSTACK_SIZE=512KB"},
         });
-        examples_step.dependOn(&link_step.step);
+
+        // the emcc linker creates 3 output files (.html, .wasm and .js)
+        const install = b.addInstallDirectory(.{
+            .source_dir = out_file.dirname(),
+            .install_dir = .prefix,
+            .install_subdir = "web",
+        });
+        examples_step.dependOn(&install.step);
 
         // a special run step to run the build result via emrun
-        run = emRunStep(b, .{ .name = example.name, .emsdk = options.emsdk });
-        run.step.dependOn(&link_step.step);
+        run = emRunStep(b, .{ .file = out_file, .emsdk = options.emsdk });
+        run.step.dependOn(&install.step);
     }
     b.step(b.fmt("run-{s}", .{example.name}), b.fmt("Run {s}", .{example.name})).dependOn(&run.step);
 }
